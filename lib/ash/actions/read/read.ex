@@ -164,247 +164,305 @@ defmodule Ash.Actions.Read do
         query
       end
 
-    initial_query = query
-
-    query = add_field_level_auth(query, query.domain, opts)
-
-    query = %{
-      query
-      | timeout:
-          opts[:timeout] || query.timeout || (query.action && query.action.timeout) ||
-            Ash.Domain.Info.timeout(query.domain)
-    }
-
-    query =
-      add_calc_context_to_query(
-        query,
-        opts[:actor],
-        opts[:authorize?],
-        query.tenant,
-        opts[:tracer],
-        query.domain,
-        expand?: false,
-        parent_stack: parent_stack_from_context(query.context)
-      )
-
-    relationship? = Map.has_key?(query.context, :accessing_from)
-
-    page_opts =
-      if Keyword.has_key?(opts, :page) do
-        page_opts(action, opts[:page], relationship?)
-      else
-        page_opts(action, query.page, relationship?)
-      end
-
-    opts = Keyword.delete(opts, :page)
-
-    query = Ash.Query.page(query, page_opts)
-
-    query =
-      if opts[:initial_data] do
-        query
-      else
-        load_and_select_sort(query, page_opts)
-      end
-
-    query = add_relationship_count_aggregates(query)
-
-    pkey = Ash.Resource.Info.primary_key(query.resource)
-
-    missing_pkeys? =
-      opts[:initial_data] &&
-        Enum.any?(opts[:initial_data], fn record ->
-          Enum.any?(Map.take(record, pkey), fn {_, v} -> is_nil(v) end)
-        end)
-
-    reuse_values? = Keyword.get(opts, :reuse_values?, false)
-
-    {calculations_in_query, calculations_at_runtime, query} =
-      Ash.Actions.Read.Calculations.split_and_load_calculations(
-        query.domain,
-        query,
-        missing_pkeys?,
-        Keyword.fetch(opts, :initial_data),
-        reuse_values?,
-        opts[:authorize?]
-      )
-
-    query =
-      add_calc_context_to_query(
-        query,
-        opts[:actor],
-        opts[:authorize?],
-        query.tenant,
-        opts[:tracer],
-        query.domain,
-        expand?: false,
-        parent_stack: parent_stack_from_context(query.context)
-      )
-
-    calculations_at_runtime =
-      Enum.map(
-        calculations_at_runtime,
-        &add_calc_context(
-          &1,
-          opts[:actor],
-          opts[:authorize?],
-          query.tenant,
-          opts[:tracer],
-          query.domain,
-          query.resource,
-          parent_stack: parent_stack_from_context(query.context)
-        )
-      )
-
-    calculations_in_query =
-      Enum.map(
-        calculations_in_query,
-        &add_calc_context(
-          &1,
-          opts[:actor],
-          opts[:authorize?],
-          query.tenant,
-          opts[:tracer],
-          query.domain,
-          query.resource,
-          parent_stack: parent_stack_from_context(query.context)
-        )
-      )
-
-    source_fields =
-      if !opts[:initial_data] do
-        source_fields(query)
-      end
-
-    query =
-      if opts[:initial_data] do
-        select = source_fields(query, opts[:lazy?] && opts[:initial_data]) ++ (query.select || [])
-
-        select =
-          if reuse_values? do
-            remove_already_selected(select, opts[:initial_data])
+    if !Enum.empty?(query.union) && !opts[:initial_data] &&
+         !Ash.DataLayer.data_layer_can?(query.resource, :union) do
+      Enum.reduce_while(query.union, {:ok, []}, fn union_query, {:ok, results} ->
+        limit =
+          if union_query.limit && query.limit do
+            min(query.limit, union_query.limit)
           else
-            select
+            union_query.limit || query.limit
           end
 
-        query = %{query | select: select}
+        query
+        |> Ash.Query.limit(limit)
+        |> Ash.Query.offset(union_query.offset)
+        |> Ash.Query.unset(:sort)
+        |> Ash.Query.unset(:union)
+        |> Ash.Query.sort(union_query.sort)
+        |> Ash.Query.do_filter(union_query.filter)
+        |> unpaginated_read(action, Keyword.put(opts, :return_query?, false))
+        |> case do
+          {:ok, new_results} ->
+            {:cont, {:ok, results ++ new_results}}
 
-        if opts[:lazy?] do
-          unload_loaded_calculations_and_aggregates(query, opts[:initial_data])
-        else
-          query
+          {:error, error} ->
+            {:halt, {:error, error}}
         end
-      else
-        Ash.Query.ensure_selected(query, source_fields)
-      end
-
-    {query, stop?} = add_async_limiter(query, calculations_at_runtime, opts)
-
-    try do
-      data_result =
-        if opts[:initial_data] do
-          load(
-            opts[:initial_data],
+      end)
+      |> case do
+        {:ok, results} ->
+          results
+          |> Enum.drop(query.offset || 0)
+          |> then(fn records ->
+            if query.limit do
+              Enum.take(records, query.limit)
+            else
+              records
+            end
+          end)
+          |> Helpers.restrict_field_access(query)
+          |> add_tenant(query)
+          |> attach_fields(opts[:initial_data], query, query, false)
+          |> cleanup_field_auth(query)
+          |> add_page(
+            query.action,
+            # TODO: count
+            nil,
+            query.sort,
             query,
-            calculations_at_runtime,
-            calculations_in_query,
-            missing_pkeys?,
+            query,
             opts
           )
-        else
-          do_read(query, calculations_at_runtime, calculations_in_query, source_fields, opts)
-        end
-
-      {data_result, query_ran} =
-        case data_result do
-          {:ok, _result, _count, _calculations_at_runtime, _calculations_in_query, query} =
-              data_result ->
-            {data_result, query}
-
-          {{:error, _} = data_result, query} ->
-            {data_result, query}
-
-          data_result ->
-            {data_result, query}
-        end
-
-      with {:ok, data, count, calculations_at_runtime, calculations_in_query, new_query} <-
-             data_result,
-           data = add_tenant(data, query),
-           {:ok, data} <-
-             load_through_attributes(
-               data,
-               %{query_ran | calculations: Map.new(calculations_in_query, &{&1.name, &1})},
-               query.domain,
-               opts[:actor],
-               opts[:tracer],
-               opts[:authorize?]
-             ),
-           {:ok, data} <-
-             load_relationships(data, query, opts),
-           {:ok, data} <-
-             Ash.Actions.Read.Calculations.run(
-               data,
-               query,
-               calculations_at_runtime,
-               calculations_in_query
-             ),
-           {:ok, data} <-
-             load_through_attributes(
-               data,
-               %{
-                 query
-                 | calculations: Map.new(calculations_at_runtime, &{&1.name, &1}),
-                   load_through: Map.delete(query.load_through || %{}, :attribute)
-               },
-               query.domain,
-               opts[:actor],
-               opts[:tracer],
-               opts[:authorize?],
-               false
-             ) do
-        query =
-          query
-          # prevent leakage of stale pid as we stop it at the end of reading
-          |> clear_async_limiter()
-
-        data
-        |> Helpers.restrict_field_access(query)
-        |> add_tenant(query)
-        |> attach_fields(opts[:initial_data], initial_query, query, missing_pkeys?)
-        |> cleanup_field_auth(query)
-        |> add_page(
-          query.action,
-          count,
-          query.sort,
-          query,
-          new_query,
-          opts
-        )
-        |> add_query(query, opts)
-      else
-        {:error, %Ash.Query{errors: errors} = query} ->
-          {:error, Ash.Error.to_error_class(errors, query: query)}
-
-        {:error,
-         %Ash.Error.Forbidden.Placeholder{
-           authorizer: authorizer
-         }} ->
-          error =
-            Ash.Authorizer.exception(
-              authorizer,
-              :forbidden,
-              query_ran.context[:private][:authorizer_state][authorizer]
-            )
-
-          {:error, Ash.Error.to_error_class(error)}
+          |> add_query(query, opts)
 
         {:error, error} ->
-          {:error, Ash.Error.to_error_class(error, query: query)}
+          {:error, error}
       end
-    after
-      if stop? do
-        Agent.stop(query.context[:private][:async_limiter])
+    else
+      initial_query = query
+
+      query = add_field_level_auth(query, query.domain, opts)
+
+      query = %{
+        query
+        | timeout:
+            opts[:timeout] || query.timeout || (query.action && query.action.timeout) ||
+              Ash.Domain.Info.timeout(query.domain)
+      }
+
+      query =
+        add_calc_context_to_query(
+          query,
+          opts[:actor],
+          opts[:authorize?],
+          query.tenant,
+          opts[:tracer],
+          query.domain,
+          expand?: false,
+          parent_stack: parent_stack_from_context(query.context)
+        )
+
+      relationship? = Map.has_key?(query.context, :accessing_from)
+
+      page_opts =
+        if Keyword.has_key?(opts, :page) do
+          page_opts(action, opts[:page], relationship?)
+        else
+          page_opts(action, query.page, relationship?)
+        end
+
+      opts = Keyword.delete(opts, :page)
+
+      query = Ash.Query.page(query, page_opts)
+
+      query =
+        if opts[:initial_data] do
+          query
+        else
+          load_and_select_sort(query, page_opts)
+        end
+
+      query = add_relationship_count_aggregates(query)
+
+      pkey = Ash.Resource.Info.primary_key(query.resource)
+
+      missing_pkeys? =
+        opts[:initial_data] &&
+          Enum.any?(opts[:initial_data], fn record ->
+            Enum.any?(Map.take(record, pkey), fn {_, v} -> is_nil(v) end)
+          end)
+
+      reuse_values? = Keyword.get(opts, :reuse_values?, false)
+
+      {calculations_in_query, calculations_at_runtime, query} =
+        Ash.Actions.Read.Calculations.split_and_load_calculations(
+          query.domain,
+          query,
+          missing_pkeys?,
+          Keyword.fetch(opts, :initial_data),
+          reuse_values?,
+          opts[:authorize?]
+        )
+
+      query =
+        add_calc_context_to_query(
+          query,
+          opts[:actor],
+          opts[:authorize?],
+          query.tenant,
+          opts[:tracer],
+          query.domain,
+          expand?: false,
+          parent_stack: parent_stack_from_context(query.context)
+        )
+
+      calculations_at_runtime =
+        Enum.map(
+          calculations_at_runtime,
+          &add_calc_context(
+            &1,
+            opts[:actor],
+            opts[:authorize?],
+            query.tenant,
+            opts[:tracer],
+            query.domain,
+            query.resource,
+            parent_stack: parent_stack_from_context(query.context)
+          )
+        )
+
+      calculations_in_query =
+        Enum.map(
+          calculations_in_query,
+          &add_calc_context(
+            &1,
+            opts[:actor],
+            opts[:authorize?],
+            query.tenant,
+            opts[:tracer],
+            query.domain,
+            query.resource,
+            parent_stack: parent_stack_from_context(query.context)
+          )
+        )
+
+      source_fields =
+        if !opts[:initial_data] do
+          source_fields(query)
+        end
+
+      query =
+        if opts[:initial_data] do
+          select =
+            source_fields(query, opts[:lazy?] && opts[:initial_data]) ++ (query.select || [])
+
+          select =
+            if reuse_values? do
+              remove_already_selected(select, opts[:initial_data])
+            else
+              select
+            end
+
+          query = %{query | select: select}
+
+          if opts[:lazy?] do
+            unload_loaded_calculations_and_aggregates(query, opts[:initial_data])
+          else
+            query
+          end
+        else
+          Ash.Query.ensure_selected(query, source_fields)
+        end
+
+      {query, stop?} = add_async_limiter(query, calculations_at_runtime, opts)
+
+      try do
+        data_result =
+          if opts[:initial_data] do
+            load(
+              opts[:initial_data],
+              query,
+              calculations_at_runtime,
+              calculations_in_query,
+              missing_pkeys?,
+              opts
+            )
+          else
+            do_read(query, calculations_at_runtime, calculations_in_query, source_fields, opts)
+          end
+
+        {data_result, query_ran} =
+          case data_result do
+            {:ok, _result, _count, _calculations_at_runtime, _calculations_in_query, query} =
+                data_result ->
+              {data_result, query}
+
+            {{:error, _} = data_result, query} ->
+              {data_result, query}
+
+            data_result ->
+              {data_result, query}
+          end
+
+        with {:ok, data, count, calculations_at_runtime, calculations_in_query, new_query} <-
+               data_result,
+             data = add_tenant(data, query),
+             {:ok, data} <-
+               load_through_attributes(
+                 data,
+                 %{query_ran | calculations: Map.new(calculations_in_query, &{&1.name, &1})},
+                 query.domain,
+                 opts[:actor],
+                 opts[:tracer],
+                 opts[:authorize?]
+               ),
+             {:ok, data} <-
+               load_relationships(data, query, opts),
+             {:ok, data} <-
+               Ash.Actions.Read.Calculations.run(
+                 data,
+                 query,
+                 calculations_at_runtime,
+                 calculations_in_query
+               ),
+             {:ok, data} <-
+               load_through_attributes(
+                 data,
+                 %{
+                   query
+                   | calculations: Map.new(calculations_at_runtime, &{&1.name, &1}),
+                     load_through: Map.delete(query.load_through || %{}, :attribute)
+                 },
+                 query.domain,
+                 opts[:actor],
+                 opts[:tracer],
+                 opts[:authorize?],
+                 false
+               ) do
+          query =
+            query
+            # prevent leakage of stale pid as we stop it at the end of reading
+            |> clear_async_limiter()
+
+          data
+          |> Helpers.restrict_field_access(query)
+          |> add_tenant(query)
+          |> attach_fields(opts[:initial_data], initial_query, query, missing_pkeys?)
+          |> cleanup_field_auth(query)
+          |> add_page(
+            query.action,
+            count,
+            query.sort,
+            query,
+            new_query,
+            opts
+          )
+          |> add_query(query, opts)
+        else
+          {:error, %Ash.Query{errors: errors} = query} ->
+            {:error, Ash.Error.to_error_class(errors, query: query)}
+
+          {:error,
+           %Ash.Error.Forbidden.Placeholder{
+             authorizer: authorizer
+           }} ->
+            error =
+              Ash.Authorizer.exception(
+                authorizer,
+                :forbidden,
+                query_ran.context[:private][:authorizer_state][authorizer]
+              )
+
+            {:error, Ash.Error.to_error_class(error)}
+
+          {:error, error} ->
+            {:error, Ash.Error.to_error_class(error, query: query)}
+        end
+      after
+        if stop? do
+          Agent.stop(query.context[:private][:async_limiter])
+        end
       end
     end
   end

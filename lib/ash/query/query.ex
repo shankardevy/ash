@@ -169,6 +169,7 @@ defmodule Ash.Query do
     invalid_keys: MapSet.new(),
     load_through: %{},
     action_failed?: false,
+    union: [],
     after_action: [],
     authorize_results: [],
     aggregates: %{},
@@ -197,6 +198,7 @@ defmodule Ash.Query do
           filter: Ash.Filter.t() | nil,
           resource: module,
           tenant: term(),
+          union: [t()],
           timeout: pos_integer() | nil,
           action_failed?: boolean,
           after_action: [
@@ -383,6 +385,10 @@ defmodule Ash.Query do
     end
   end
 
+  defmodule Union do
+    defstruct [:filter, :sort, :limit, :offset]
+  end
+
   @doc """
   Attach a filter statement to the query labelled as user input.
 
@@ -413,6 +419,42 @@ defmodule Ash.Query do
       {:error, error} ->
         add_error(query, :filter, error)
     end
+  end
+
+  @doc """
+  Produces a query that is the union of multiple statements.
+
+  All aspects of the parent query are applied to the combination
+  of all of the unions.
+
+  See `Ash.Query.Union` for what keys can be specified on each union.
+
+  ### Examples
+
+  ```elixir
+  # Top ten and bottom ten users who are not on the upswing or downswing
+  User
+  |> Ash.Query.filter(active == true)
+  |> Ash.Query.union_of([
+    %Ash.Query.Union{
+      sort: [score: :desc],
+      filter: expr(not(on_a_losing_streak)),
+      limit: 10
+    },
+    %Ash.Query.Union{
+      sort: [score: :asc],
+      filter: expr(not(on_a_winning_streak)),
+      limit: 10
+    }
+  ])
+  |> Ash.read!()
+  ```
+  """
+  @spec union_of(t(), Keyword.t() | t()) :: t()
+  def union_of(query, unions) do
+    query = new(query)
+
+    %{query | union: query.union ++ List.wrap(unions)}
   end
 
   @doc """
